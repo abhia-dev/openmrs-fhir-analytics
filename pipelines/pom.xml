@@ -94,10 +94,11 @@
 
       <dependency>
         <groupId>org.mockito</groupId>
-        <artifactId>mockito-core</artifactId>
+        <artifactId>mockito-inline</artifactId>
         <version>${mockito.version}</version>
         <scope>test</scope>
       </dependency>
+
       <dependency>
         <groupId>com.beust</groupId>
         <artifactId>jcommander</artifactId>
@@ -156,7 +157,7 @@
 
     <dependency>
       <groupId>org.mockito</groupId>
-      <artifactId>mockito-core</artifactId>
+      <artifactId>mockito-inline</artifactId>
     </dependency>
   </dependencies>
 
@@ -363,8 +364,7 @@
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-compiler-plugin</artifactId>
         <configuration>
-          <source>8</source>
-          <target>8</target>
+          <release>11</release>
         </configuration>
       </plugin>
       <plugin>

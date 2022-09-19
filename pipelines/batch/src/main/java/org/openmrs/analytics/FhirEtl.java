@@ -18,12 +18,14 @@ import java.beans.PropertyVetoException;
 import java.io.IOException;
 import java.sql.SQLException;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
 import ca.uhn.fhir.context.FhirContext;
+import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
@@ -31,9 +33,12 @@ import org.apache.avro.Schema;
 import org.apache.beam.sdk.Pipeline;
 import org.apache.beam.sdk.PipelineResult;
 import org.apache.beam.sdk.coders.CannotProvideCoderException;
+import org.apache.beam.sdk.io.FileIO;
+import org.apache.beam.sdk.io.jdbc.JdbcIO;
 import org.apache.beam.sdk.options.PipelineOptionsFactory;
 import org.apache.beam.sdk.transforms.Create;
 import org.apache.beam.sdk.transforms.Flatten;
+import org.apache.beam.sdk.transforms.ParDo;
 import org.apache.beam.sdk.transforms.Sum;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
@@ -68,8 +73,8 @@ public class FhirEtl {
 	}
 	
 	static OpenmrsUtil createOpenmrsUtil(FhirEtlOptions options, FhirContext fhirContext) {
-		return new OpenmrsUtil(options.getFhirServerUrl(),
-		        options.getFhirServerUserName(), options.getFhirServerPassword(), fhirContext);
+		return new OpenmrsUtil(options.getFhirServerUrl(), options.getFhirServerUserName(), options.getFhirServerPassword(),
+		        fhirContext);
 	}
 	
 	private static Schema getSchema(String resourceType) {
@@ -147,7 +152,7 @@ public class FhirEtl {
 		JdbcConnectionUtil jdbcConnectionUtil = new JdbcConnectionUtil(options.getJdbcDriverClass(),
 		        dbConfig.makeJdbsUrlFromConfig(), dbConfig.getDbUser(), dbConfig.getDbPassword(),
 		        options.getJdbcInitialPoolSize(), options.getJdbcMaxPoolSize());
-		JdbcFetchUtil jdbcUtil = new JdbcFetchUtil(jdbcConnectionUtil);
+		JdbcFetchOpenMrs jdbcUtil = new JdbcFetchOpenMrs(jdbcConnectionUtil);
 		int batchSize = Math.min(options.getBatchSize(), 170); // batch size > 200 will result in HTTP 400 Bad Request
 		Map<String, List<String>> reverseMap = jdbcUtil.createFhirReverseMap(options.getResourceList(), dbConfig);
 		// process each table-resource mappings
@@ -168,11 +173,10 @@ public class FhirEtl {
 			}
 			for (String resourceType : entry.getValue()) {
 				resourceTypes.add(resourceType);
-				String baseBundleUrl = options.getFhirServerUrl() + "/"
-				        + resourceType;
+				String baseBundleUrl = options.getFhirServerUrl() + "/" + resourceType;
 				PCollection<SearchSegmentDescriptor> inputSegments = uuids.apply(
 				    String.format("CreateSearchSegments_%s_table_%s", resourceType, tableName),
-				    new JdbcFetchUtil.CreateSearchSegments(resourceType, baseBundleUrl, batchSize));
+				    new JdbcFetchOpenMrs.CreateSearchSegments(resourceType, baseBundleUrl, batchSize));
 				allPatientIds.add(fetchSegmentsAndReturnPatientIds(inputSegments, resourceType, options));
 			}
 		}
@@ -185,7 +189,7 @@ public class FhirEtl {
 		EtlUtils.logMetrics(result.metrics());
 	}
 	
-	static void validateOptions(FhirEtlOptions options) {
+	private static void validateOptions(FhirEtlOptions options) throws SQLException, PropertyVetoException {
 		if (!options.getActivePeriod().isEmpty()) {
 			Set<String> resourceSet = Sets.newHashSet(options.getResourceList().split(","));
 			if (resourceSet.contains("Patient")) {
@@ -199,6 +203,80 @@ public class FhirEtl {
 				                + options.getResourceList());
 			}
 		}
+		
+		if (!options.getSourceJsonFilePattern().isEmpty()) {
+			if (!options.getFhirServerUrl().isEmpty()) {
+				throw new IllegalArgumentException("--sourceJsonFilePattern and --fhirServerUrl cannot be used together!");
+			}
+			if (options.isJdbcModeEnabled()) {
+				throw new IllegalArgumentException("--sourceJsonFilePattern and --jdbcModeEnabled cannot be used together!");
+			}
+			if (!options.getActivePeriod().isEmpty()) {
+				throw new IllegalArgumentException(
+				        "Enabling --activePeriod is not supported when reading from file input (--sourceJsonFilePattern)!");
+			}
+		} else { // options.getSourceJsonFilePattern() is not set.
+			if (options.getFhirServerUrl().isEmpty()) {
+				throw new IllegalArgumentException("Either --fhirServerUrl or --sourceJsonFilePattern should be set!");
+			}
+		}
+		
+		if (!options.getSinkDbUrl().isEmpty()) {
+			JdbcResourceWriter.createTables(options);
+		}
+	}
+	
+	/**
+	 * Driver function for running JDBC direct fetch mode with a HAPI source server. The JDBC fetch mode
+	 * uses Beam JdbcIO to fetch FHIR resources directly from the HAPI server's database and uses the
+	 * ParquetUtil to write resources.
+	 */
+	//TODO: Implement active period feature for JDBC mode with a HAPI source server (Github issue #278).
+	static void runHapiJdbcFetch(FhirEtlOptions options, DatabaseConfiguration dbConfig, FhirContext fhirContext)
+	        throws PropertyVetoException {
+		Pipeline pipeline = Pipeline.create(options);
+		JdbcConnectionUtil jdbcConnectionUtil = new JdbcConnectionUtil(options.getJdbcDriverClass(),
+		        dbConfig.makeJdbsUrlFromConfig(), dbConfig.getDbUser(), dbConfig.getDbPassword(),
+		        options.getJdbcInitialPoolSize(), options.getJdbcMaxPoolSize());
+		FhirSearchUtil fhirSearchUtil = createFhirSearchUtil(options, fhirContext);
+		
+		//Get the resource count for each resource type and distribute the query workload based on batch size.
+		HashMap<String, Integer> resourceCount = (HashMap<String, Integer>) fhirSearchUtil
+		        .searchResourceCounts(options.getResourceList());
+		
+		for (String resourceType : options.getResourceList().split(",")) {
+			int numResources = resourceCount.get(resourceType);
+			
+			PCollection<QueryParameterDescriptor> queryParameters = pipeline
+			        .apply("Generate query parameters for " + resourceType, Create.of(
+			            new JdbcFetchHapi(jdbcConnectionUtil).generateQueryParameters(options, resourceType, numResources)));
+			
+			PCollection<HapiRowDescriptor> payload = queryParameters.apply("JdbcIO fetch for " + resourceType,
+			    new JdbcFetchHapi.FetchRowsJdbcIo(
+			            JdbcIO.DataSourceConfiguration.create(jdbcConnectionUtil.getDataSource())));
+			
+			payload.apply("Convert to parquet for " + resourceType,
+			    ParDo.of(new ConvertResourceFn(options, "ConvertResourceFn")));
+		}
+		
+		PipelineResult result = pipeline.run();
+		result.waitUntilFinish();
+		EtlUtils.logMetrics(result.metrics());
+	}
+	
+	static void runJsonRead(FhirEtlOptions options, FhirContext fhirContext) {
+		Preconditions.checkArgument(!options.getSourceJsonFilePattern().isEmpty());
+		Preconditions.checkArgument(!options.isJdbcModeEnabled());
+		Preconditions.checkArgument(options.getActivePeriod().isEmpty());
+		
+		Pipeline pipeline = Pipeline.create(options);
+		PCollection<FileIO.ReadableFile> files = pipeline
+		        .apply(FileIO.match().filepattern(options.getSourceJsonFilePattern())).apply(FileIO.readMatches());
+		files.apply("Read JSON files", ParDo.of(new ReadJsonFilesFn(options)));
+		
+		PipelineResult result = pipeline.run();
+		result.waitUntilFinish();
+		EtlUtils.logMetrics(result.metrics());
 	}
 	
 	public static void main(String[] args)
@@ -212,9 +290,23 @@ public class FhirEtl {
 		log.info("Flags: " + options);
 		validateOptions(options);
 		
+		if (!options.getSinkDbUrl().isEmpty()) {
+			JdbcResourceWriter.createTables(options);
+		}
+		
 		if (options.isJdbcModeEnabled()) {
-			DatabaseConfiguration dbConfig = DatabaseConfiguration.createConfigFromFile(options.getFhirDebeziumConfigPath());
-			runFhirJdbcFetch(options, dbConfig, fhirContext);
+			if (options.isJdbcModeHapi()) {
+				DatabaseConfiguration dbConfig = DatabaseConfiguration
+				        .createConfigFromFile(options.getFhirDatabaseConfigPath());
+				runHapiJdbcFetch(options, dbConfig, fhirContext);
+			} else {
+				DatabaseConfiguration dbConfig = DatabaseConfiguration
+				        .createConfigFromFile(options.getFhirDebeziumConfigPath());
+				runFhirJdbcFetch(options, dbConfig, fhirContext);
+			}
+			
+		} else if (!options.getSourceJsonFilePattern().isEmpty()) {
+			runJsonRead(options, fhirContext);
 		} else {
 			runFhirFetch(options, fhirContext);
 		}
